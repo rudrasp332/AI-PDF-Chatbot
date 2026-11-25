@@ -1,9 +1,10 @@
 
+import os
 import streamlit as st
-import ollama
 import faiss
 import numpy as np
 
+from groq import Groq
 from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
@@ -56,7 +57,24 @@ def load_embedding_model():
 
 
 # =====================================
-# 4. SIDEBAR
+# 4. GROQ CLIENT
+# =====================================
+
+def get_groq_client():
+
+    api_key = os.getenv("GROQ_API_KEY")
+
+    if not api_key:
+        raise ValueError(
+            "GROQ_API_KEY is missing. "
+            "Please configure your Groq API key."
+        )
+
+    return Groq(api_key=api_key)
+
+
+# =====================================
+# 5. SIDEBAR
 # =====================================
 
 with st.sidebar:
@@ -83,7 +101,7 @@ with st.sidebar:
 
         st.write("Vector Database: FAISS")
 
-        st.write("LLM: Mimo (Ollama)")
+        st.write("LLM: Groq Cloud")
 
     else:
 
@@ -91,11 +109,13 @@ with st.sidebar:
 
     st.divider()
 
-    st.caption("Built with Streamlit, FAISS and Ollama")
+    st.caption(
+        "Built with Streamlit, FAISS and Groq Cloud"
+    )
 
 
 # =====================================
-# 5. PDF UPLOAD
+# 6. PDF UPLOAD
 # =====================================
 
 uploaded_file = st.file_uploader(
@@ -105,7 +125,7 @@ uploaded_file = st.file_uploader(
 
 
 # =====================================
-# 6. PDF PROCESSING
+# 7. PDF PROCESSING
 # =====================================
 
 if uploaded_file is not None:
@@ -126,29 +146,28 @@ if uploaded_file is not None:
         st.session_state.chunk_pages = []
         st.session_state.index = None
 
-        # ---------------------------------
-        # Extract PDF text page by page
-        # ---------------------------------
-
         try:
 
-            reader = PdfReader(uploaded_file)
+            # Extract PDF text page by page
+            with st.spinner("Extracting PDF text..."):
 
-            pages_text = []
+                reader = PdfReader(uploaded_file)
 
-            for page_number, page in enumerate(
-                reader.pages,
-                start=1
-            ):
+                pages_text = []
 
-                text = page.extract_text()
+                for page_number, page in enumerate(
+                    reader.pages,
+                    start=1
+                ):
 
-                if text and text.strip():
+                    text = page.extract_text()
 
-                    pages_text.append({
-                        "page": page_number,
-                        "text": text
-                    })
+                    if text and text.strip():
+
+                        pages_text.append({
+                            "page": page_number,
+                            "text": text
+                        })
 
             if not pages_text:
 
@@ -159,7 +178,7 @@ if uploaded_file is not None:
             else:
 
                 # ---------------------------------
-                # 7. TEXT SPLITTING
+                # 8. TEXT SPLITTING
                 # ---------------------------------
 
                 splitter = RecursiveCharacterTextSplitter(
@@ -184,12 +203,19 @@ if uploaded_file is not None:
                             page_data["page"]
                         )
 
+                if not chunks:
+
+                    st.warning(
+                        "No text chunks could be created."
+                    )
+                    st.stop()
+
                 st.session_state.chunks = chunks
 
                 st.session_state.chunk_pages = chunk_pages
 
                 # ---------------------------------
-                # 8. GENERATE EMBEDDINGS
+                # 9. GENERATE EMBEDDINGS
                 # ---------------------------------
 
                 with st.spinner("Creating embeddings..."):
@@ -204,7 +230,7 @@ if uploaded_file is not None:
                     )
 
                 # ---------------------------------
-                # 9. STORE IN FAISS
+                # 10. STORE IN FAISS
                 # ---------------------------------
 
                 faiss.normalize_L2(embeddings)
@@ -223,9 +249,11 @@ if uploaded_file is not None:
 
             st.error(f"PDF Processing Error: {e}")
 
+            st.session_state.index = None
+
 
 # =====================================
-# 10. CHATBOT
+# 11. CHATBOT
 # =====================================
 
 if st.session_state.index is not None:
@@ -281,7 +309,7 @@ if st.session_state.index is not None:
         try:
 
             # ---------------------------------
-            # 11. QUESTION EMBEDDING
+            # 12. QUESTION EMBEDDING
             # ---------------------------------
 
             model = load_embedding_model()
@@ -296,7 +324,7 @@ if st.session_state.index is not None:
             faiss.normalize_L2(query_embedding)
 
             # ---------------------------------
-            # 12. FAISS SEARCH
+            # 13. FAISS SEARCH
             # ---------------------------------
 
             scores, indices = st.session_state.index.search(
@@ -323,28 +351,28 @@ if st.session_state.index is not None:
             context = "\n\n".join(retrieved_chunks)
 
             # ---------------------------------
-            # 13. CREATE OLLAMA MESSAGES
+            # 14. CREATE LLM MESSAGES
             # ---------------------------------
 
             messages = [
                 {
                     "role": "system",
                     "content": f"""
-                    You are an AI PDF assistant.
+You are an AI PDF assistant.
 
-                    Answer using only the PDF context.
+Answer using only the PDF context.
 
-                    Use previous conversation to understand
-                    follow-up questions.
+Use previous conversation to understand
+follow-up questions.
 
-                    Do not invent information.
+Do not invent information.
 
-                    If the answer is not available in the
-                    PDF context, say so.
+If the answer is not available in the
+PDF context, say so.
 
-                    PDF Context:
-                    {context}
-                    """
+PDF Context:
+{context}
+"""
                 }
             ]
 
@@ -354,7 +382,7 @@ if st.session_state.index is not None:
             )
 
             # ---------------------------------
-            # 14. STREAMING RESPONSE
+            # 15. GROQ CLOUD STREAMING RESPONSE
             # ---------------------------------
 
             with st.chat_message("assistant"):
@@ -363,19 +391,35 @@ if st.session_state.index is not None:
 
                 with st.spinner("Thinking..."):
 
-                    stream = ollama.chat(
-                        model="mimo-v2.6:latest",
+                    client = get_groq_client()
+
+                    stream = client.chat.completions.create(
+                        model=os.getenv(
+                            "GROQ_MODEL",
+                            "openai/gpt-oss-20b"
+                        ),
                         messages=messages,
+                        temperature=0.3,
                         stream=True
                     )
 
+                    def generate_response():
+
+                        for chunk in stream:
+
+                            content = (
+                                chunk.choices[0].delta.content
+                            )
+
+                            if content:
+                                yield content
+
                     answer = st.write_stream(
-                        chunk["message"]["content"]
-                        for chunk in stream
+                        generate_response()
                     )
 
                 # ---------------------------------
-                # 15. DISPLAY SOURCES
+                # 16. DISPLAY SOURCES
                 # ---------------------------------
 
                 st.caption("📚 Sources")
@@ -394,7 +438,7 @@ if st.session_state.index is not None:
                     st.write("No sources found.")
 
             # ---------------------------------
-            # 16. SAVE CHAT HISTORY
+            # 17. SAVE CHAT HISTORY
             # ---------------------------------
 
             st.session_state.chat_history.append({
@@ -409,5 +453,7 @@ if st.session_state.index is not None:
 
             # Remove failed user question
             st.session_state.chat_history.pop()
+
 else:
+
     st.info("📄 Please upload a PDF to start chatting.")
