@@ -409,8 +409,5 @@ if st.session_state.index is not None:
 
             # Remove failed user question
             st.session_state.chat_history.pop()
-
-
 else:
-
     st.info("📄 Please upload a PDF to start chatting.")
