@@ -1,0 +1,12 @@
+
+streamlit
+pypdf
+langchain-text-splitters
+sentence-transformers
+faiss-cpu
+numpy
+langchain-groq
+python-dotenv
+ollama
+
+
