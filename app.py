@@ -1,18 +1,19 @@
 
 import os
+import hashlib
+
 import streamlit as st
-import faiss
 import numpy as np
 
 from groq import Groq
 from pypdf import PdfReader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 
-# =====================================
+# =========================================
 # 1. STREAMLIT CONFIGURATION
-# =====================================
+# =========================================
 
 st.set_page_config(
     page_title="AI PDF Chatbot",
@@ -24,65 +25,192 @@ st.title("🤖 AI PDF Chatbot")
 st.caption("Upload your PDF and chat with its content.")
 
 
-# =====================================
+# =========================================
 # 2. SESSION STATE
-# =====================================
+# =========================================
 
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+defaults = {
+    "chat_history": [],
+    "pdf_id": None,
+    "chunks": [],
+    "chunk_pages": [],
+    "vectorizer": None,
+    "tfidf_matrix": None
+}
 
-if "pdf_id" not in st.session_state:
-    st.session_state.pdf_id = None
-
-if "chunks" not in st.session_state:
-    st.session_state.chunks = []
-
-if "chunk_pages" not in st.session_state:
-    st.session_state.chunk_pages = []
-
-if "index" not in st.session_state:
-    st.session_state.index = None
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
-# =====================================
-# 3. LOAD EMBEDDING MODEL
-# =====================================
+# =========================================
+# 3. GROQ CLIENT
+# =========================================
 
 @st.cache_resource
-def load_embedding_model():
-
-    return SentenceTransformer(
-        "sentence-transformers/all-MiniLM-L6-v2"
-    )
-
-
-# =====================================
-# 4. GROQ CLIENT
-# =====================================
-
-def get_groq_client():
-
-    api_key = os.getenv("GROQ_API_KEY")
-
-    if not api_key:
-        raise ValueError(
-            "GROQ_API_KEY is missing. "
-            "Please configure your Groq API key."
-        )
-
+def get_groq_client(api_key):
     return Groq(api_key=api_key)
 
 
-# =====================================
-# 5. SIDEBAR
-# =====================================
+def get_groq_client_safely():
+    api_key = os.getenv("GROQ_API_KEY")
+
+    if not api_key:
+        st.error(
+            "Groq API key not found. "
+            "Please configure GROQ_API_KEY."
+        )
+        return None
+
+    return get_groq_client(api_key)
+
+
+# =========================================
+# 4. TEXT CHUNKING
+# =========================================
+
+def create_chunks(text, page_number, chunk_size=500, overlap=50):
+
+    chunks = []
+
+    start = 0
+
+    while start < len(text):
+
+        end = start + chunk_size
+
+        chunk = text[start:end].strip()
+
+        if chunk:
+            chunks.append({
+                "text": chunk,
+                "page": page_number
+            })
+
+        if end >= len(text):
+            break
+
+        start = end - overlap
+
+    return chunks
+
+
+# =========================================
+# 5. PDF PROCESSING
+# =========================================
+
+def process_pdf(pdf_bytes):
+
+    reader = PdfReader(
+        __import__("io").BytesIO(pdf_bytes)
+    )
+
+    all_chunks = []
+
+    for page_number, page in enumerate(
+        reader.pages,
+        start=1
+    ):
+
+        page_text = page.extract_text()
+
+        if not page_text or not page_text.strip():
+            continue
+
+        page_chunks = create_chunks(
+            page_text,
+            page_number
+        )
+
+        all_chunks.extend(page_chunks)
+
+    if not all_chunks:
+        raise ValueError(
+            "No readable text found in this PDF."
+        )
+
+    chunk_texts = [
+        item["text"] for item in all_chunks
+    ]
+
+    chunk_pages = [
+        item["page"] for item in all_chunks
+    ]
+
+    # Build lightweight TF-IDF index
+    vectorizer = TfidfVectorizer(
+        stop_words="english",
+        max_features=20000,
+        dtype=np.float32
+    )
+
+    tfidf_matrix = vectorizer.fit_transform(
+        chunk_texts
+    )
+
+    return (
+        chunk_texts,
+        chunk_pages,
+        vectorizer,
+        tfidf_matrix
+    )
+
+
+# =========================================
+# 6. RETRIEVAL
+# =========================================
+
+def retrieve_context(question, top_k=3):
+
+    vectorizer = st.session_state.vectorizer
+    matrix = st.session_state.tfidf_matrix
+
+    query_vector = vectorizer.transform(
+        [question]
+    )
+
+    scores = cosine_similarity(
+        query_vector,
+        matrix
+    ).flatten()
+
+    best_indices = np.argsort(scores)[::-1][:top_k]
+
+    retrieved_chunks = []
+    source_pages = set()
+
+    for idx in best_indices:
+
+        # Ignore chunks with no keyword overlap
+        if scores[idx] <= 0:
+            continue
+
+        retrieved_chunks.append(
+            st.session_state.chunks[idx]
+        )
+
+        source_pages.add(
+            st.session_state.chunk_pages[idx]
+        )
+
+    return (
+        "\n\n".join(retrieved_chunks),
+        sorted(source_pages)
+    )
+
+
+# =========================================
+# 7. SIDEBAR
+# =========================================
 
 with st.sidebar:
 
     st.header("⚙️ Settings")
 
-    if st.button("🗑️ Clear Chat", use_container_width=True):
-
+    if st.button(
+        "🗑️ Clear Chat",
+        use_container_width=True
+    ):
         st.session_state.chat_history = []
         st.rerun()
 
@@ -90,7 +218,7 @@ with st.sidebar:
 
     st.subheader("📄 PDF Information")
 
-    if st.session_state.index is not None:
+    if st.session_state.pdf_id:
 
         st.success("PDF Loaded")
 
@@ -99,7 +227,7 @@ with st.sidebar:
             len(st.session_state.chunks)
         )
 
-        st.write("Vector Database: FAISS")
+        st.write("Vector Database: TF-IDF")
 
         st.write("LLM: Groq Cloud")
 
@@ -110,13 +238,13 @@ with st.sidebar:
     st.divider()
 
     st.caption(
-        "Built with Streamlit, FAISS and Groq Cloud"
+        "Built with Streamlit, Scikit-learn and Groq"
     )
 
 
-# =====================================
-# 6. PDF UPLOAD
-# =====================================
+# =========================================
+# 8. PDF UPLOAD
+# =========================================
 
 uploaded_file = st.file_uploader(
     "Upload your PDF",
@@ -124,148 +252,62 @@ uploaded_file = st.file_uploader(
 )
 
 
-# =====================================
-# 7. PDF PROCESSING
-# =====================================
-
 if uploaded_file is not None:
 
-    # Identify uploaded PDF
-    pdf_id = (
-        uploaded_file.name,
-        uploaded_file.size,
-        uploaded_file.getvalue()
-    )
+    pdf_bytes = uploaded_file.getvalue()
 
-    if st.session_state.pdf_id != pdf_id:
+    pdf_hash = hashlib.sha256(
+        pdf_bytes
+    ).hexdigest()
 
-        st.session_state.pdf_id = pdf_id
+    if st.session_state.pdf_id != pdf_hash:
 
-        st.session_state.chat_history = []
-        st.session_state.chunks = []
-        st.session_state.chunk_pages = []
-        st.session_state.index = None
+        with st.spinner("Processing PDF..."):
 
-        try:
+            try:
 
-            # Extract PDF text page by page
-            with st.spinner("Extracting PDF text..."):
+                (
+                    chunks,
+                    chunk_pages,
+                    vectorizer,
+                    tfidf_matrix
+                ) = process_pdf(pdf_bytes)
 
-                reader = PdfReader(uploaded_file)
-
-                pages_text = []
-
-                for page_number, page in enumerate(
-                    reader.pages,
-                    start=1
-                ):
-
-                    text = page.extract_text()
-
-                    if text and text.strip():
-
-                        pages_text.append({
-                            "page": page_number,
-                            "text": text
-                        })
-
-            if not pages_text:
-
-                st.warning(
-                    "No readable text found in this PDF."
-                )
-
-            else:
-
-                # ---------------------------------
-                # 8. TEXT SPLITTING
-                # ---------------------------------
-
-                splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=500,
-                    chunk_overlap=50
-                )
-
-                chunks = []
-                chunk_pages = []
-
-                for page_data in pages_text:
-
-                    page_chunks = splitter.split_text(
-                        page_data["text"]
-                    )
-
-                    for chunk in page_chunks:
-
-                        chunks.append(chunk)
-
-                        chunk_pages.append(
-                            page_data["page"]
-                        )
-
-                if not chunks:
-
-                    st.warning(
-                        "No text chunks could be created."
-                    )
-                    st.stop()
+                st.session_state.pdf_id = pdf_hash
 
                 st.session_state.chunks = chunks
 
                 st.session_state.chunk_pages = chunk_pages
 
-                # ---------------------------------
-                # 9. GENERATE EMBEDDINGS
-                # ---------------------------------
+                st.session_state.vectorizer = vectorizer
 
-                with st.spinner("Creating embeddings..."):
+                st.session_state.tfidf_matrix = tfidf_matrix
 
-                    model = load_embedding_model()
+                st.session_state.chat_history = []
 
-                    embeddings = model.encode(chunks)
+                st.success(
+                    f"PDF processed successfully! "
+                    f"{len(chunks)} chunks created."
+                )
 
-                    embeddings = np.array(
-                        embeddings,
-                        dtype="float32"
-                    )
+            except Exception as e:
 
-                # ---------------------------------
-                # 10. STORE IN FAISS
-                # ---------------------------------
+                st.session_state.pdf_id = None
 
-                faiss.normalize_L2(embeddings)
-
-                dimension = embeddings.shape[1]
-
-                index = faiss.IndexFlatIP(dimension)
-
-                index.add(embeddings)
-
-                st.session_state.index = index
-
-                st.success("PDF processed successfully!")
-
-        except Exception as e:
-
-            st.error(f"PDF Processing Error: {e}")
-
-            st.session_state.index = None
+                st.error(f"PDF Processing Error: {e}")
 
 
-# =====================================
-# 11. CHATBOT
-# =====================================
+# =========================================
+# 9. CHATBOT
+# =========================================
 
-if st.session_state.index is not None:
+if st.session_state.pdf_id is not None:
 
     st.divider()
 
     st.subheader("💬 Chat with your PDF")
 
-    # ---------------------------------
-    # Display Previous Messages
-    # ---------------------------------
-
+    # Display previous messages
     for message in st.session_state.chat_history:
 
         with st.chat_message(message["role"]):
@@ -278,26 +320,21 @@ if st.session_state.index is not None:
 
                 if sources:
 
-                    st.caption("📚 Sources")
-
-                    st.write(
+                    st.caption(
+                        "📚 Sources: " +
                         ", ".join(
-                            f"PDF Page {page}"
-                            for page in sources
+                            f"PDF Page {p}"
+                            for p in sources
                         )
                     )
 
-    # ---------------------------------
-    # Chat Input
-    # ---------------------------------
-
+    # Chat input
     question = st.chat_input(
         "Ask a question about your PDF..."
     )
 
     if question:
 
-        # Save user message
         st.session_state.chat_history.append({
             "role": "user",
             "content": question
@@ -308,151 +345,114 @@ if st.session_state.index is not None:
 
         try:
 
-            # ---------------------------------
-            # 12. QUESTION EMBEDDING
-            # ---------------------------------
-
-            model = load_embedding_model()
-
-            query_embedding = model.encode([question])
-
-            query_embedding = np.array(
-                query_embedding,
-                dtype="float32"
+            context, source_pages = retrieve_context(
+                question,
+                top_k=3
             )
 
-            faiss.normalize_L2(query_embedding)
+            if not context:
 
-            # ---------------------------------
-            # 13. FAISS SEARCH
-            # ---------------------------------
+                answer = (
+                    "I could not find relevant information "
+                    "for this question in the PDF."
+                )
 
-            scores, indices = st.session_state.index.search(
-                query_embedding,
-                k=min(3, st.session_state.index.ntotal)
-            )
+            else:
 
-            retrieved_chunks = []
+                client = get_groq_client_safely()
 
-            source_pages = set()
+                if client is None:
+                    st.stop()
 
-            for idx in indices[0]:
-
-                if idx != -1:
-
-                    retrieved_chunks.append(
-                        st.session_state.chunks[idx]
-                    )
-
-                    source_pages.add(
-                        st.session_state.chunk_pages[idx]
-                    )
-
-            context = "\n\n".join(retrieved_chunks)
-
-            # ---------------------------------
-            # 14. CREATE LLM MESSAGES
-            # ---------------------------------
-
-            messages = [
-                {
-                    "role": "system",
-                    "content": f"""
+                system_prompt = f"""
 You are an AI PDF assistant.
 
-Answer using only the PDF context.
+Answer using only the provided PDF context.
 
-Use previous conversation to understand
+Use the previous conversation to understand
 follow-up questions.
 
 Do not invent information.
 
-If the answer is not available in the
-PDF context, say so.
+If the answer is not available in the PDF,
+clearly say so.
 
 PDF Context:
 {context}
 """
-                }
-            ]
 
-            # Include recent conversation
-            messages.extend(
-                st.session_state.chat_history[-10:]
-            )
+                messages = [
+                    {
+                        "role": "system",
+                        "content": system_prompt
+                    }
+                ]
 
-            # ---------------------------------
-            # 15. GROQ CLOUD STREAMING RESPONSE
-            # ---------------------------------
+                messages.extend(
+                    st.session_state.chat_history[-10:]
+                )
 
+                with st.chat_message("assistant"):
+
+                    st.write("🤖 **AI Assistant**")
+
+                    with st.spinner("Thinking..."):
+
+                        stream = client.chat.completions.create(
+                            model=os.getenv(
+                                "GROQ_MODEL",
+                                "openai/gpt-oss-20b"
+                            ),
+                            messages=messages,
+                            temperature=0.3,
+                            max_completion_tokens=800,
+                            stream=True
+                        )
+
+                        def generate_response():
+
+                            for chunk in stream:
+
+                                content = (
+                                    chunk.choices[0].delta.content
+                                )
+
+                                if content:
+                                    yield content
+
+                        answer = st.write_stream(
+                            generate_response()
+                        )
+
+            # Display sources
             with st.chat_message("assistant"):
-
-                st.write("🤖 **AI Assistant**")
-
-                with st.spinner("Thinking..."):
-
-                    client = get_groq_client()
-
-                    stream = client.chat.completions.create(
-                        model=os.getenv(
-                            "GROQ_MODEL",
-                            "openai/gpt-oss-20b"
-                        ),
-                        messages=messages,
-                        temperature=0.3,
-                        stream=True
-                    )
-
-                    def generate_response():
-
-                        for chunk in stream:
-
-                            content = (
-                                chunk.choices[0].delta.content
-                            )
-
-                            if content:
-                                yield content
-
-                    answer = st.write_stream(
-                        generate_response()
-                    )
-
-                # ---------------------------------
-                # 16. DISPLAY SOURCES
-                # ---------------------------------
-
-                st.caption("📚 Sources")
 
                 if source_pages:
 
-                    st.write(
+                    st.caption(
+                        "📚 Sources: " +
                         ", ".join(
-                            f"PDF Page {page}"
-                            for page in sorted(source_pages)
+                            f"PDF Page {p}"
+                            for p in source_pages
                         )
                     )
 
-                else:
-
-                    st.write("No sources found.")
-
-            # ---------------------------------
-            # 17. SAVE CHAT HISTORY
-            # ---------------------------------
-
+            # Save assistant response
             st.session_state.chat_history.append({
                 "role": "assistant",
                 "content": answer,
-                "sources": sorted(source_pages)
+                "sources": source_pages
             })
 
         except Exception as e:
 
             st.error(f"Something went wrong: {e}")
 
-            # Remove failed user question
-            st.session_state.chat_history.pop()
+            if (
+                st.session_state.chat_history
+                and st.session_state.chat_history[-1]["role"] == "user"
+            ):
+                st.session_state.chat_history.pop()
 
 else:
 
